@@ -72,6 +72,13 @@ sensor:
     id: dtu_error_counter
     accuracy_decimals: 0
 
+  - platform: template
+    name: "Batterie SOC"
+    id: battery_soc
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    icon: "mdi:battery"
+
 switch:
   - platform: gpio
     pin: GPIO2
@@ -102,11 +109,26 @@ interval:
                   then:
                     - lambda: |-
                         json::parse_json(body, [](JsonObject root) -> bool {
-                          // Path in JSON: root["battery"]["voltage"]["v"]
+                            bool success = false;
+                            
+                            // 1. Extract voltage
+                            // Path in JSON: root["battery"]["voltage"]["v"]
                             if (root["battery"]["voltage"]["v"]) {
                                 float v = root["battery"]["voltage"]["v"];
                                 id(battery_voltage).publish_state(v);
+                                success = true;
+                            }
+                            
+                            // 2. Extract SOC
+                            if (root["battery"]["soc"]["v"]) {
+                                float soc = root["battery"]["soc"]["v"];
+                                id(battery_soc).publish_state(soc);
+                                success = true;
+                            }
+
+                            if (success) {
                                 id(dtu_error_counter).publish_state(0);
+                                id(dtu_error_counter).publish_state(true);
                                 return true;
                             } else {
                                 ESP_LOGW("http_test", "JSON path battery.voltage.v not found!");
@@ -118,6 +140,8 @@ interval:
                         format: "Error: Status: %d"
                         args: [ 'response->status_code' ]
                     - lambda: "id(dtu_error_counter).publish_state(id(dtu_error_counter).state + 1);"
+
+              # check safety conditions after processing the response
               - script.execute: check_safety_conditions
 
 script:
