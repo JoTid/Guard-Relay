@@ -1,0 +1,126 @@
+esphome:
+  name: pv-battery-guard
+  friendly_name: PV Battery Guard
+  # Optimization 1: Reduces binary size and improves performance
+  project:
+    name: "battery.guard"
+    version: "1.1"
+
+  platformio_options:
+    board_build.f_cpu: 240000000L # Ensure it runs at full clock
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+  # Fixes the warning in the log
+  variant: ESP32
+  # If your chip is newer, this enables modern instructions
+  # minimum_chip_revision: 3
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret ha_api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # manual IP added because the ESP is on a different network
+  manual_ip:
+    # Set this to the IP of the ESP
+    static_ip: !secret my_static_ip
+    # Set this to the IP address of the router. Often ends with .1
+    gateway: !secret my_gateway
+    # The subnet of the network. 255.255.255.0 works for most home networks.
+    subnet: !secret my_subnet
+
+  power_save_mode: none
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Pv-Battery-Guard"
+    password: !secret ap_password
+
+captive_portal:
+
+http_request:
+  #useragent: esphome/device
+  useragent: "esph/1"
+  timeout: 5s
+  # Larger buffers prevent the ESP from stalling while receiving
+  buffer_size_rx: 2048
+
+# Enable logging
+logger:
+  level: INFO
+
+sensor:
+  - platform: template
+    name: "Battery Voltage"
+    id: battery_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+
+  - platform: template
+    name: "OpenDTU Error Counter"
+    id: dtu_error_counter
+    accuracy_decimals: 0
+
+switch:
+  - platform: gpio
+    pin: GPIO2
+    id: my_relay
+    name: "Protection Relay"
+    restore_mode: ALWAYS_OFF
+
+interval:
+  - interval: 10s
+    startup_delay: 2s # Waits after boot until WiFi/API are stable
+    then:
+      - http_request.get:
+          # URL of the OpenDTU endpoint that provides the battery data
+          url: http://192.168.2.54/api/livedata/status
+          capture_response: true  # ESSENTIAL so that we can process the response in Lambda
+          on_response:
+            then:
+              - if:
+                  condition:
+                    lambda: return response->status_code == 200;
+                  then:
+                    - lambda: |-
+                        json::parse_json(body, [](JsonObject root) -> bool {
+                          // Path in JSON: root["battery"]["voltage"]["v"]
+                            if (root["battery"]["voltage"]["v"]) {
+                                float v = root["battery"]["voltage"]["v"];
+                                id(battery_voltage).publish_state(v);
+                                id(dtu_error_counter).publish_state(0);
+                                return true;
+                            } else {
+                                ESP_LOGW("http_test", "JSON path battery.voltage.v not found!");
+                                return false;
+                            }
+                        });
+                  else:
+                    - logger.log:
+                        format: "Error: Status: %d"
+                        args: [ 'response->status_code' ]
+                    - lambda: "id(dtu_error_counter).publish_state(id(dtu_error_counter).state + 1);"
+              - script.execute: check_safety_conditions
+
+script:
+  - id: check_safety_conditions
+    then:
+      - lambda: |-
+          float v = id(battery_voltage).state;
+          float err = id(dtu_error_counter).state;
+          if (err >= 3 || (!std::isnan(v) && v < 42.0)) {
+            id(my_relay).turn_off();
+          } else if (err == 0 && v >= 49.0) {
+            id(my_relay).turn_on();
+          }
