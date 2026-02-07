@@ -93,6 +93,58 @@ switch:
     restore_mode: RESTORE_DEFAULT_ON
     icon: "mdi:robot"
 
+#PV Battery Guard - Logic: (Voltage OR SOC < Min) -> OFF | (Voltage AND SOC > Max) -> ON
+number:
+  # Voltage Thresholds
+  - platform: template
+    name: "Cutoff Voltage (V_min)"
+    id: v_min_cutoff
+    min_value: 40.0
+    max_value: 48.0
+    step: 0.1
+    initial_value: 45.0
+    unit_of_measurement: "V"
+    mode: box
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "Recovery Voltage (V_max)"
+    id: v_max_recovery
+    min_value: 48.1
+    max_value: 56.0
+    step: 0.1
+    initial_value: 52.0
+    unit_of_measurement: "V"
+    mode: box
+    restore_value: true
+    optimistic: true
+
+  # SOC Thresholds
+  - platform: template
+    name: "Cutoff SOC (%_min)"
+    id: soc_min_cutoff
+    min_value: 5
+    max_value: 30
+    step: 1
+    initial_value: 15
+    unit_of_measurement: "%"
+    mode: box
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "Recovery SOC (%_max)"
+    id: soc_max_recovery
+    min_value: 31
+    max_value: 100
+    step: 1
+    initial_value: 40
+    unit_of_measurement: "%"
+    mode: box
+    restore_value: true
+    optimistic: true
+
 interval:
   - interval: 10s
     startup_delay: 2s # Waits after boot until WiFi/API are stable
@@ -128,7 +180,6 @@ interval:
 
                             if (success) {
                                 id(dtu_error_counter).publish_state(0);
-                                id(dtu_error_counter).publish_state(true);
                                 return true;
                             } else {
                                 ESP_LOGW("http_test", "JSON path battery.voltage.v not found!");
@@ -144,29 +195,45 @@ interval:
               # check safety conditions after processing the response
               - script.execute: check_safety_conditions
 
+
 script:
   - id: check_safety_conditions
     then:
       - lambda: |-
-          // 1. Check Automatic Mode
+          // 1. Exit if manual mode is active
           if (!id(auto_mode).state) {
-            ESP_LOGD("safety", "Automatic mode disabled - No action.");
+            ESP_LOGD("safety", "Auto mode disabled - skipping logic.");
             return; 
           }
 
-          // 2. Auto-Mode = ON
+          // 2. Get current sensor values
           float v = id(battery_voltage).state;
+          float soc = id(battery_soc).state;
           float err = id(dtu_error_counter).state;
           
-          if (err >= 3 || (!std::isnan(v) && v < 45.0)) {
-            if (id(ac_relay).state) {
-                id(ac_relay).turn_off();
-                ESP_LOGW("safety", "Automatic: Switch OFF at %.2fV", v);
-            }
+          // 3. Get thresholds from HA numbers
+          float v_off = id(v_min_cutoff).state;
+          float v_on  = id(v_max_recovery).state;
+          float soc_off = id(soc_min_cutoff).state;
+          float soc_on  = id(soc_max_recovery).state;
+
+          // 4. Logic Decision
+          // CRITICAL: Turn OFF if error or any value below limit
+          bool critical = (err >= 3) || 
+                          (!std::isnan(v) && v < v_off) || 
+                          (!std::isnan(soc) && soc < soc_off);
+
+          // RECOVERY: Turn ON only if NO error and ALL values above recovery limit
+          bool recovery = (err == 0) && 
+                          (!std::isnan(v) && v >= v_on) && 
+                          (!std::isnan(soc) && soc >= soc_on);
+
+          // 5. Execution
+          if (critical && id(ac_relay).state) {
+              id(ac_relay).turn_off();
+              ESP_LOGW("safety", "PROTECTION: OFF -> V:%.1f (Min:%.1f), SOC:%.1f (Min:%.1f)", v, v_off, soc, soc_off);
           } 
-          else if (err == 0 && !std::isnan(v) && v >= 52.0) {
-            if (!id(ac_relay).state) {
-                id(ac_relay).turn_on();
-                ESP_LOGI("safety", "Automatic: Switch ON at %.2fV", v);
-            }
+          else if (recovery && !id(ac_relay).state) {
+              id(ac_relay).turn_on();
+              ESP_LOGI("safety", "RECOVERY: ON -> V:%.1f (Req:%.1f), SOC:%.1f (Req:%.1f)", v, v_on, soc, soc_on);
           }
