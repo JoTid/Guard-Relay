@@ -73,7 +73,7 @@ sensor:
     accuracy_decimals: 0
 
   - platform: template
-    name: "Batterie SOC"
+    name: "Battery SOC"
     id: battery_soc
     unit_of_measurement: "%"
     accuracy_decimals: 1
@@ -87,11 +87,18 @@ switch:
     restore_mode: ALWAYS_OFF
 
   - platform: template
-    name: "Automatic Mode"
-    id: auto_mode
+    name: "Automatic Mode SOC"
+    id: auto_mode_soc
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
     icon: "mdi:robot"
+
+  - platform: template
+    name: "Automatic Mode Voltage"
+    id: auto_mode_voltage
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    icon: "mdi:robot-angry"
 
 #PV Battery Guard - Logic: (Voltage OR SOC < Min) -> OFF | (Voltage AND SOC > Max) -> ON
 number:
@@ -124,7 +131,7 @@ number:
   - platform: template
     name: "Cutoff SOC (%_min)"
     id: soc_min_cutoff
-    min_value: 5
+    min_value: 0
     max_value: 30
     step: 1
     initial_value: 15
@@ -136,7 +143,7 @@ number:
   - platform: template
     name: "Recovery SOC (%_max)"
     id: soc_max_recovery
-    min_value: 31
+    min_value: 0
     max_value: 100
     step: 1
     initial_value: 40
@@ -200,40 +207,46 @@ script:
   - id: check_safety_conditions
     then:
       - lambda: |-
-          // 1. Exit if manual mode is active
-          if (!id(auto_mode).state) {
-            ESP_LOGD("safety", "Auto mode disabled - skipping logic.");
-            return; 
-          }
-
-          // 2. Get current sensor values
+          // 1. Initialise variables with current states to ensure they are available for logging
           float v = id(battery_voltage).state;
           float soc = id(battery_soc).state;
           float err = id(dtu_error_counter).state;
           
-          // 3. Get thresholds from HA numbers
+          // Get thresholds (always available)
           float v_off = id(v_min_cutoff).state;
           float v_on  = id(v_max_recovery).state;
           float soc_off = id(soc_min_cutoff).state;
           float soc_on  = id(soc_max_recovery).state;
 
-          // 4. Logic Decision
-          // CRITICAL: Turn OFF if error or any value below limit
-          bool critical = (err >= 3) || 
-                          (!std::isnan(v) && v < v_off) || 
-                          (!std::isnan(soc) && soc < soc_off);
+          // 2. Base conditions
+          bool critical = (err >= 3);
+          // Recovery starts as true but must survive all active checks
+          bool recovery = (err == 0);
+          
+          // Flag to check if ANY auto mode is active at all
+          bool any_auto_active = id(auto_mode_soc).state || id(auto_mode_voltage).state;
 
-          // RECOVERY: Turn ON only if NO error and ALL values above recovery limit
-          bool recovery = (err == 0) && 
-                          (!std::isnan(v) && v >= v_on) && 
-                          (!std::isnan(soc) && soc >= soc_on);
+          // 3. SOC Logic
+          if (id(auto_mode_soc).state) {
+            critical = critical || (!std::isnan(soc) && soc < soc_off);
+            recovery = recovery && (!std::isnan(soc) && soc >= soc_on);
+          }
 
-          // 5. Execution
+          // 4. Voltage Logic
+          if (id(auto_mode_voltage).state) {
+            critical = critical || (!std::isnan(v) && v < v_off);
+            recovery = recovery && (!std::isnan(v) && v >= v_on);
+          }
+
+          // 5. Global Safety Net: If NO auto mode is selected, we should NOT auto-recover
+          if (!any_auto_active) recovery = false;
+
+          // 6. Execution
           if (critical && id(ac_relay).state) {
               id(ac_relay).turn_off();
-              ESP_LOGW("safety", "PROTECTION: OFF -> V:%.1f (Min:%.1f), SOC:%.1f (Min:%.1f)", v, v_off, soc, soc_off);
+              ESP_LOGW("safety", "PROTECTION: OFF -> V:%.1f, SOC:%.1f, Err:%.0f", v, soc, err);
           } 
           else if (recovery && !id(ac_relay).state) {
               id(ac_relay).turn_on();
-              ESP_LOGI("safety", "RECOVERY: ON -> V:%.1f (Req:%.1f), SOC:%.1f (Req:%.1f)", v, v_on, soc, soc_on);
+              ESP_LOGI("safety", "RECOVERY: ON -> V:%.1f, SOC:%.1f", v, soc);
           }
